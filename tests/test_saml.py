@@ -192,14 +192,20 @@ class _SamlLookup:
         status: str | None = None,
         source_profile: dict | None = None,
         claim_mappings: tuple[dict, ...] = (),
+        directly_linked_accounts: frozenset[str] = frozenset(),
     ):
         self.accounts = accounts
         self.status = status
         self.source_profile = source_profile
         self.claim_mappings = claim_mappings
+        self.directly_linked_accounts = directly_linked_accounts
 
     def iter_user_saml_accounts(self):
         yield from self.accounts
+
+    def directly_linked_saml_account_ids(self, idp_id: str) -> frozenset[str]:
+        assert idp_id == "0oa_idp"
+        return self.directly_linked_accounts
 
     def user_status(self, user_id: str) -> str | None:
         assert user_id in {"00u_okta_user", "00u_saml_user"}
@@ -242,6 +248,22 @@ def test_saml_lookup_reads_source_profile_and_ordered_claim_mappings() -> None:
     )
     connection.execute(
         """
+        CREATE TABLE okta.identity_provider_users (
+            id VARCHAR,
+            idp_id VARCHAR
+        )
+        """
+    )
+    connection.executemany(
+        "INSERT INTO okta.identity_provider_users VALUES (?, ?)",
+        [
+            ("00u_direct_b", "0oa_idp"),
+            ("00u_direct_a", "0oa_idp"),
+            ("00u_other_idp", "0oa_other"),
+        ],
+    )
+    connection.execute(
+        """
         CREATE TABLE okta.saml_claim_mappings (
             id VARCHAR,
             app_id VARCHAR,
@@ -273,6 +295,9 @@ def test_saml_lookup_reads_source_profile_and_ordered_claim_mappings() -> None:
         "login": "Alice.Login",
         "custom": "C-1",
     }
+    assert lookup.directly_linked_saml_account_ids("0oa_idp") == frozenset(
+        {"00u_direct_a", "00u_direct_b"}
+    )
     assert [row["id"] for row in lookup.saml_claim_mappings("0oa_saml")] == [
         "okta:saml:claim-mapping:0oa_saml:2",
         "okta:saml:claim-mapping:0oa_saml:10",
@@ -1358,6 +1383,57 @@ def test_inbound_automatic_username_policy_emits_canonical_rule_and_accounts():
         ["alice@example.test"],
         ["blocked@example.test"],
     ]
+
+
+def test_inbound_rule_candidates_do_not_overwrite_direct_account_binding():
+    idp = _identity_provider(policy=_automatic_username_policy())
+    service_provider_row = saml_service_provider_row(idp)
+    assert service_provider_row is not None
+
+    lookup = _SamlLookup(
+        accounts=(
+            ("00u_okta_user", "ACTIVE", "alice@example.test"),
+            ("00u_unlinked", "ACTIVE", "bob@example.test"),
+            ("00u_blocked", "SUSPENDED", "blocked@example.test"),
+        ),
+        status="ACTIVE",
+        directly_linked_accounts=frozenset({"00u_okta_user"}),
+    )
+    service_provider = SamlServiceProvider.model_validate(service_provider_row)
+    service_provider._lookup = lookup
+    direct_user = _idp_user(
+        profile={
+            "email": "alice@example.test",
+            "subjectNameId": "alice",
+            "subjectNameQualifier": "example.test",
+        }
+    )
+    direct_user._lookup = lookup
+
+    edges = [*service_provider.edges, *direct_user.edges]
+    account_edges = [edge for edge in edges if edge.kind == ek.SAML_HAS_ACCOUNT]
+    account_edge_keys = [
+        (edge.start.value, edge.end.value, edge.kind) for edge in account_edges
+    ]
+
+    assert len(account_edge_keys) == len(set(account_edge_keys))
+    assert {edge.end.value for edge in account_edges} == {
+        "00u_okta_user",
+        "00u_unlinked",
+        "00u_blocked",
+    }
+    direct_account = next(
+        edge for edge in account_edges if edge.end.value == "00u_okta_user"
+    )
+    assert direct_account.properties.direct_binding is True
+    assert direct_account.properties.direct_binding_source == (
+        "GET /api/v1/idps/{idpId}/users"
+    )
+    assert {
+        edge.start.value
+        for edge in edges
+        if edge.kind == ek.SAML_HAS_ACCOUNT_RESOLUTION_VALUE
+    } == {"00u_okta_user", "00u_unlinked", "00u_blocked"}
 
 
 def test_inbound_subject_nameid_policy_uses_route_scoped_exact_values():

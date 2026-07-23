@@ -2006,22 +2006,26 @@ class SamlServiceProvider(BaseAsset):
         except AttributeError:
             return
 
+        directly_linked_account_ids = lookup.directly_linked_saml_account_ids(
+            self.idp_id
+        )
         for account_id, native_status, login in lookup.iter_user_saml_accounts():
             match_values = _dedupe([login])
             if not match_values:
                 continue
-            yield Edge(
-                kind=ek.SAML_HAS_ACCOUNT,
-                start=EdgePath(value=self.id, match_by="id"),
-                end=EdgePath(value=account_id, match_by="id"),
-                properties=SamlAccountEdgeProperties(
-                    traversable=False,
-                    match_values=match_values,
-                    source_property="profile.login",
-                    account_state=normalize_okta_account_state(native_status),
-                    direct_binding=False,
-                ),
-            )
+            if account_id not in directly_linked_account_ids:
+                yield Edge(
+                    kind=ek.SAML_HAS_ACCOUNT,
+                    start=EdgePath(value=self.id, match_by="id"),
+                    end=EdgePath(value=account_id, match_by="id"),
+                    properties=SamlAccountEdgeProperties(
+                        traversable=False,
+                        match_values=match_values,
+                        source_property="profile.login",
+                        account_state=normalize_okta_account_state(native_status),
+                        direct_binding=False,
+                    ),
+                )
             yield Edge(
                 kind=ek.SAML_HAS_ACCOUNT_RESOLUTION_VALUE,
                 start=EdgePath(value=account_id, match_by="id"),

@@ -72,6 +72,21 @@ class OktaLookup(LookupManager):
             yield from rows
 
     @lru_cache
+    def directly_linked_saml_account_ids(self, idp_id: str) -> frozenset[str]:
+        """Return native Okta accounts already linked to one inbound IdP."""
+
+        rows = self._find_all_objects(
+            f"""
+            SELECT id
+            FROM {self.schema}.identity_provider_users
+            WHERE idp_id = ?
+            ORDER BY id
+            """,
+            [idp_id],
+        )
+        return frozenset(account_id for (account_id,) in rows)
+
+    @lru_cache
     def user_status(self, user_id: str) -> str | None:
         try:
             return self._find_single_object(

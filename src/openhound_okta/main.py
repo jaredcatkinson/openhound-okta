@@ -73,6 +73,7 @@ def preprocess(ctx: PreProcContext):
         "devices": "devices",
         "authorization_servers": "authorization_servers",
         "identity_providers": "identity_providers",
+        "identity_provider_users": "identity_provider_users",
         "policies": "policies",
         "resources": "resources",
         "user_role_assignments": "user_role_assignments",
