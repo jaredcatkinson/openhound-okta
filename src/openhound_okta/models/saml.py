@@ -18,6 +18,8 @@ SAML_CONTRACT_VERSION = "opengraph-saml-v0.3.0"
 ACCOUNT_RESOLUTION_PROFILE = "saml_account_resolution_v1"
 EMAIL_NAME_ID_FORMAT = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
 UNSPECIFIED_NAME_ID_FORMAT = "urn:oasis:names:tc:SAML:1.0:nameid-format:unspecified"
+TRANSIENT_NAME_ID_FORMAT = "urn:oasis:names:tc:SAML:2.0:nameid-format:transient"
+PERSISTENT_NAME_ID_FORMAT = "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent"
 UNSPECIFIED_ATTRIBUTE_NAME_FORMAT = (
     "urn:oasis:names:tc:SAML:2.0:attrname-format:unspecified"
 )
@@ -469,6 +471,288 @@ def _application_user_value(template: str | None, application_user: Any) -> str 
     return None
 
 
+_DIRECT_PROFILE_EXPRESSION = re.compile(
+    r"^(source|user|appuser)\.([A-Za-z_][A-Za-z0-9_]*)$"
+)
+_EMAIL_CLAIM_NAMES = {
+    "email",
+    "mail",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
+}
+_UPN_CLAIM_NAMES = {
+    "upn",
+    "userprincipalname",
+    "http://schemas.xmlsoap.org/claims/upn",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn",
+}
+_ENTRA_OBJECT_ID_CLAIM_NAMES = {
+    "http://schemas.microsoft.com/identity/claims/objectidentifier",
+}
+_COMMON_ASSERTION_FIELDS = (
+    "email_match_values",
+    "upn_match_values",
+    "entra_object_id_match_values",
+    "scoped_exact_match_values",
+)
+_MISSING = object()
+
+
+def _mapping_get(mapping: Any, name: str, default: Any = None) -> Any:
+    if isinstance(mapping, dict):
+        return mapping.get(name, default)
+    return getattr(mapping, name, default)
+
+
+def _direct_profile_field(expression: Any) -> tuple[str, str] | None:
+    value = _clean(expression)
+    if not value:
+        return None
+    if value.startswith("${") and value.endswith("}"):
+        value = value[2:-1].strip()
+    match = _DIRECT_PROFILE_EXPRESSION.fullmatch(value)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _profile_dict(profile: Any) -> dict[str, Any] | None:
+    if profile is None:
+        return None
+    if isinstance(profile, dict):
+        return profile
+    model_dump = getattr(profile, "model_dump", None)
+    if callable(model_dump):
+        return model_dump(by_alias=True)
+    return None
+
+
+def _profile_field(profile: Any, field_name: str) -> Any:
+    values = _profile_dict(profile)
+    if values is None:
+        return _MISSING
+    if field_name in values:
+        return values[field_name]
+    casefolded = {
+        key.casefold(): value for key, value in values.items() if isinstance(key, str)
+    }
+    return casefolded.get(field_name.casefold(), _MISSING)
+
+
+def _source_exact_values(value: Any) -> list[str]:
+    if value is _MISSING or value is None or isinstance(value, dict):
+        return []
+    candidates = value if isinstance(value, (list, tuple, set)) else [value]
+    result: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate is None or isinstance(candidate, (dict, list, tuple, set)):
+            continue
+        source_exact = candidate if isinstance(candidate, str) else str(candidate)
+        if not source_exact.strip() or source_exact in seen:
+            continue
+        seen.add(source_exact)
+        result.append(source_exact)
+    return result
+
+
+def _dedupe_exact(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
+def _application_user_direct_values(
+    direct_field: tuple[str, str],
+    application_user: Any,
+    source_profile: Any = _MISSING,
+) -> list[str]:
+    namespace, field_name = direct_field
+    profile = getattr(application_user, "profile", None)
+    credentials = getattr(application_user, "credentials", None)
+
+    if namespace == "appuser":
+        if field_name.casefold() == "username":
+            value = getattr(credentials, "username", _MISSING)
+        else:
+            value = _profile_field(profile, field_name)
+        return _source_exact_values(value)
+
+    if source_profile is not _MISSING:
+        return _source_exact_values(_profile_field(source_profile, field_name))
+
+    # Legacy collections did not expose the source-user lookup. Preserve their
+    # resolved application username for the common source.login template.
+    if field_name.casefold() == "login" and credentials is not None:
+        username = getattr(credentials, "username", _MISSING)
+        values = _source_exact_values(username)
+        if values:
+            return values
+    return _source_exact_values(_profile_field(profile, field_name))
+
+
+def _claim_family(mapping: Any, direct_field: tuple[str, str] | None) -> str:
+    claim_type = _clean(_mapping_get(mapping, "claim_type"))
+    if claim_type == "name_id":
+        name_id_format = _clean(
+            _mapping_get(mapping, "format") or _mapping_get(mapping, "name_id_format")
+        )
+        if name_id_format == TRANSIENT_NAME_ID_FORMAT:
+            return "transient"
+        if name_id_format == EMAIL_NAME_ID_FORMAT:
+            return "email_match_values"
+        if name_id_format == PERSISTENT_NAME_ID_FORMAT:
+            return "scoped_exact_match_values"
+        if _mapping_get(mapping, "mapping_origin") == "application_user_name":
+            return "scoped_exact_match_values"
+        if direct_field:
+            field_name = direct_field[1].casefold()
+            if field_name in {"email", "mail"}:
+                return "email_match_values"
+            if field_name in {"upn", "userprincipalname"}:
+                return "upn_match_values"
+        return "raw_name_id"
+
+    claim_name = (_clean(_mapping_get(mapping, "claim_name")) or "").casefold()
+    if claim_name in _EMAIL_CLAIM_NAMES:
+        return "email_match_values"
+    if claim_name in _UPN_CLAIM_NAMES:
+        return "upn_match_values"
+    if claim_name in _ENTRA_OBJECT_ID_CLAIM_NAMES:
+        return "entra_object_id_match_values"
+    return "exceptional"
+
+
+def _canonical_common_value(family: str, source_exact: str) -> str | None:
+    value = source_exact.strip()
+    if family in {"email_match_values", "upn_match_values"}:
+        return value.casefold()
+    if family == "entra_object_id_match_values":
+        try:
+            return str(UUID(value))
+        except ValueError:
+            return None
+    if family == "scoped_exact_match_values":
+        return value
+    return None
+
+
+def _fallback_application_claim_mapping(application_user: Any) -> dict[str, Any]:
+    subject_template = getattr(application_user, "app_subject_name_id_template", None)
+    user_name_template = getattr(application_user, "app_user_name_template", None)
+    return {
+        "id": saml_claim_mapping_id(getattr(application_user, "app_id"), 0),
+        "claim_name": "NameID",
+        "mapping_type": "name_id",
+        "mapping_origin": (
+            "subject_name_id" if subject_template else "application_user_name"
+        ),
+        "claim_type": "name_id",
+        "source_property": saml_match_source(
+            subject_template or user_name_template or "appuser.userName"
+        ),
+        "expression": subject_template or user_name_template or "appuser.userName",
+        "format": _clean(getattr(application_user, "app_subject_name_id_format", None))
+        or UNSPECIFIED_NAME_ID_FORMAT,
+    }
+
+
+def saml_application_assertion_evidence(
+    application_user: Any,
+    claim_mappings: list[Any] | tuple[Any, ...] | None = None,
+    source_profile: Any = _MISSING,
+) -> dict[str, Any]:
+    """Resolve every source-proven outbound assertion value for one assignment."""
+
+    mappings = (
+        [_fallback_application_claim_mapping(application_user)]
+        if claim_mappings is None
+        else list(claim_mappings)
+    )
+    evidence: dict[str, Any] = {
+        "match_values": [],
+        "email_match_values": [],
+        "upn_match_values": [],
+        "entra_object_id_match_values": [],
+        "scoped_exact_match_values": [],
+        "incomplete_match_value_fields": [],
+        "source_properties": [],
+        "claim_values": [],
+    }
+
+    # A SAML application always has a NameID mapping. An explicitly empty
+    # preprocessed mapping set therefore means the authoritative configuration
+    # was unavailable, not that the application asserts no identity values.
+    if claim_mappings is not None and not mappings:
+        evidence["incomplete_match_value_fields"] = list(_COMMON_ASSERTION_FIELDS)
+        return evidence
+
+    incomplete_fields: set[str] = set()
+    for mapping in mappings:
+        expression = _mapping_get(mapping, "expression")
+        direct_field = _direct_profile_field(expression)
+        declared_source = _mapping_get(mapping, "source_property")
+        declared_direct = (
+            _direct_profile_field(declared_source) if declared_source else direct_field
+        )
+        source_conflict = bool(
+            direct_field and declared_source and declared_direct != direct_field
+        )
+        resolvable = direct_field is not None and not source_conflict
+        values = (
+            _application_user_direct_values(
+                direct_field, application_user, source_profile
+            )
+            if resolvable and direct_field
+            else []
+        )
+        family = _claim_family(mapping, direct_field)
+        mapping_id = _clean(_mapping_get(mapping, "id"))
+        source_property = (
+            f"{direct_field[0]}.{direct_field[1]}" if direct_field else None
+        )
+
+        if family in _COMMON_ASSERTION_FIELDS:
+            canonical_values = [
+                canonical
+                for value in values
+                if (canonical := _canonical_common_value(family, value)) is not None
+            ]
+            if not resolvable or len(canonical_values) != len(values) or not values:
+                incomplete_fields.add(family)
+            evidence["match_values"].extend(values)
+            evidence[family].extend(canonical_values)
+            if values and source_property:
+                evidence["source_properties"].append(source_property)
+            continue
+
+        if family == "raw_name_id" and values:
+            evidence["match_values"].extend(values)
+            if source_property:
+                evidence["source_properties"].append(source_property)
+            continue
+
+        if not mapping_id:
+            continue
+        exceptional = {
+            "mapping_id": mapping_id,
+            "match_values": values,
+            "canonical_match_values": ([] if family == "transient" else list(values)),
+            "unsafe_match_values": list(values) if family == "transient" else [],
+            "incomplete": not resolvable or not values,
+            "source_property": source_property,
+        }
+        evidence["claim_values"].append(exceptional)
+
+    evidence["match_values"] = _dedupe_exact(evidence["match_values"])
+    for field_name in _COMMON_ASSERTION_FIELDS:
+        evidence[field_name] = _dedupe_exact(evidence[field_name])
+    evidence["source_properties"] = _dedupe_exact(evidence["source_properties"])
+    evidence["incomplete_match_value_fields"] = [
+        field_name
+        for field_name in _COMMON_ASSERTION_FIELDS
+        if field_name in incomplete_fields
+    ]
+    return evidence
+
+
 def _idp_user_value(template: str | None, idp_user: Any) -> str | None:
     field = _template_field(template)
     profile = getattr(idp_user, "profile", None)
@@ -496,34 +780,13 @@ def saml_application_match_values(application_user: Any) -> list[str]:
 def saml_application_identity_evidence(
     application_user: Any,
 ) -> dict[str, list[str]]:
-    """Resolve the effective outbound NameID without guessing identity families."""
+    """Resolve the legacy selected NameID view for API compatibility."""
 
-    subject_template = getattr(application_user, "app_subject_name_id_template", None)
-    template = subject_template or getattr(
-        application_user, "app_user_name_template", None
-    )
-    value = _application_user_value(template, application_user)
-    match_values = _dedupe([value])
-    if not match_values:
-        return {
-            "match_values": [],
-            "email_match_values": [],
-            "scoped_exact_match_values": [],
-        }
-
-    source_property = saml_match_source(template)
-    name_id_format = _clean(
-        getattr(application_user, "app_subject_name_id_format", None)
-    )
-    is_email = source_property in {"source.email", "user.email"} or (
-        subject_template is not None and name_id_format == EMAIL_NAME_ID_FORMAT
-    )
+    evidence = saml_application_assertion_evidence(application_user)
     return {
-        "match_values": match_values,
-        "email_match_values": (
-            [value.casefold() for value in match_values] if is_email else []
-        ),
-        "scoped_exact_match_values": [] if is_email else match_values,
+        "match_values": evidence["match_values"],
+        "email_match_values": evidence["email_match_values"],
+        "scoped_exact_match_values": evidence["scoped_exact_match_values"],
     }
 
 
@@ -736,6 +999,12 @@ def _trusted_audience(identity_provider) -> str | None:
     return _clean(getattr(_idp_trust(identity_provider), "audience", None))
 
 
+def _idp_sp_entity_id(identity_provider) -> str | None:
+    return _clean(
+        getattr(identity_provider, "saml_metadata_entity_id", None)
+    ) or _trusted_audience(identity_provider)
+
+
 def _idp_acs_url(identity_provider) -> str | None:
     links = getattr(identity_provider, "links", None) or {}
     acs = links.get("acs") if isinstance(links, dict) else None
@@ -789,6 +1058,9 @@ def saml_claim_mapping_rows(application) -> list[dict[str, Any]]:
                 "app_label": application.label,
                 "claim_name": "NameID",
                 "mapping_type": "name_id",
+                "mapping_origin": (
+                    "subject_name_id" if subject_template else "application_user_name"
+                ),
                 "claim_type": "name_id",
                 "source_property": saml_match_source(
                     subject_template or user_name_template
@@ -832,6 +1104,7 @@ def saml_claim_mapping_rows(application) -> list[dict[str, Any]]:
                 "app_label": application.label,
                 "claim_name": claim_name or "attribute",
                 "mapping_type": mapping_type,
+                "mapping_origin": "attribute_statement",
                 "claim_type": "attribute",
                 "source_property": _statement_source_property(expression),
                 "expression": expression,
@@ -925,7 +1198,7 @@ def saml_service_provider_row(identity_provider) -> dict[str, Any] | None:
         "idp_name": identity_provider.name,
         "idp_type": identity_provider.type,
         "idp_status": identity_provider.status,
-        "sp_entity_id": _trusted_audience(identity_provider),
+        "sp_entity_id": _idp_sp_entity_id(identity_provider),
         "issuer_id": saml_trusted_issuer_id(identity_provider.id) if issuer else None,
         "acs_ids": [row["id"] for row in acs_rows],
         "account_resolution_rule_id": rule_id,
@@ -989,9 +1262,57 @@ def saml_sp_acs_rows(identity_provider) -> list[dict[str, Any]]:
     if not is_saml_identity_provider(identity_provider):
         return []
 
+    sp_entity_id = _idp_sp_entity_id(identity_provider)
+    if not sp_entity_id:
+        return []
+
+    metadata_routes = []
+    seen_urls: set[str] = set()
+    for endpoint in (
+        getattr(identity_provider, "saml_metadata_acs_endpoints", None) or []
+    ):
+        acs_url = _clean(getattr(endpoint, "url", None))
+        if not acs_url or acs_url in seen_urls:
+            continue
+        seen_urls.add(acs_url)
+        metadata_routes.append(
+            {
+                "acs_url": acs_url,
+                "index": getattr(endpoint, "index", None),
+                "binding": _clean(getattr(endpoint, "binding", None)),
+                "is_default": getattr(endpoint, "is_default", None),
+            }
+        )
+
+    if metadata_routes:
+        return [
+            {
+                "id": saml_sp_acs_id(identity_provider.id, row_index),
+                "app_id": identity_provider.id,
+                "app_name": identity_provider.name,
+                "app_label": identity_provider.name,
+                "source_object_kind": nk.IDP,
+                "acs_url": route["acs_url"],
+                "sp_entity_id": sp_entity_id,
+                "index": (
+                    route["index"]
+                    if route["index"] is not None
+                    else row_index
+                ),
+                "binding": route["binding"],
+                "is_default": route["is_default"],
+                "route_source": "identity_provider_metadata",
+                "extraction_mode": "explicit_metadata",
+                "acs_source_field": (
+                    "metadata.SPSSODescriptor.AssertionConsumerService.Location"
+                ),
+                "sp_entity_source_field": "metadata.EntityDescriptor.entityID",
+            }
+            for row_index, route in enumerate(metadata_routes)
+        ]
+
     acs_url = _idp_acs_url(identity_provider)
-    sp_entity_id = _trusted_audience(identity_provider)
-    if not acs_url or not sp_entity_id:
+    if not acs_url:
         return []
 
     return [
@@ -1166,6 +1487,7 @@ class SamlClaimMappingProperties(OktaNodeProperties):
         app_label: The Okta application display label.
         claim_name: The SAML claim or NameID slot being populated.
         mapping_type: The Okta mapping source, such as name_id or attribute.
+        mapping_origin: The native configuration slot that supplied the mapping.
         source_property: The portable source field name when it can be resolved.
         expression: The raw Okta expression or statement payload.
         name_id_format: The requested SAML NameID format when the mapping is NameID.
@@ -1183,6 +1505,7 @@ class SamlClaimMappingProperties(OktaNodeProperties):
     claim_name: str
     mapping_type: str
     claim_type: str
+    mapping_origin: str | None = None
     source_property: str | None = None
     expression: str | None = None
     name_id_format: str | None = None
@@ -1218,8 +1541,13 @@ class SamlMatchValuesEdgeProperties(EdgeProperties):
 
     match_values: list[str] = dc_field(default_factory=list)
     source_property: str | None = None
+    source_properties: list[str] = dc_field(default_factory=list)
     email_match_values: list[str] = dc_field(default_factory=list)
+    upn_match_values: list[str] = dc_field(default_factory=list)
+    entra_object_id_match_values: list[str] = dc_field(default_factory=list)
     scoped_exact_match_values: list[str] = dc_field(default_factory=list)
+    incomplete_match_value_fields: list[str] = dc_field(default_factory=list)
+    assignment_source: str | None = None
     schema_contract_version: str = SAML_CONTRACT_VERSION
 
 
@@ -1248,6 +1576,8 @@ class SamlResolutionValueEdgeProperties(EdgeProperties):
 
     match_values: list[str] = dc_field(default_factory=list)
     canonical_match_values: list[str] = dc_field(default_factory=list)
+    unsafe_match_values: list[str] = dc_field(default_factory=list)
+    source_property: str | None = None
     incomplete: bool = False
     schema_contract_version: str = SAML_CONTRACT_VERSION
 
@@ -1387,6 +1717,7 @@ class SamlClaimMapping(BaseAsset):
     claim_name: str
     mapping_type: str
     claim_type: str
+    mapping_origin: str | None = None
     source_property: str | None = None
     expression: str | None = None
     name_id_format: str | None = None
@@ -1412,6 +1743,7 @@ class SamlClaimMapping(BaseAsset):
                 claim_name=self.claim_name,
                 mapping_type=self.mapping_type,
                 claim_type=self.claim_type,
+                mapping_origin=self.mapping_origin,
                 source_property=self.source_property,
                 expression=self.expression,
                 name_id_format=self.name_id_format,

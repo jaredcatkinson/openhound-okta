@@ -42,6 +42,13 @@ class ACS(BaseModel):
     binding: str | None = None
 
 
+class SamlMetadataAcsEndpoint(BaseModel):
+    url: str
+    binding: str | None = None
+    index: int | None = None
+    is_default: bool | None = None
+
+
 class Authorization(BaseModel):
     binding: str | None = None
     url: str
@@ -149,6 +156,10 @@ class IdentityProvider(BaseAsset):
     protocol: Protocol
     policy: Policy | None = None
     links: dict | None = Field(default=None, alias="_links")
+    saml_metadata_entity_id: str | None = None
+    saml_metadata_acs_endpoints: list[SamlMetadataAcsEndpoint] = Field(
+        default_factory=list
+    )
 
     @computed_field
     @property

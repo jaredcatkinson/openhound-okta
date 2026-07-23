@@ -1,6 +1,8 @@
 from functools import lru_cache
+import json
+from typing import Any
 
-from duckdb import DuckDBPyConnection
+from duckdb import DuckDBPyConnection, Error as DuckDBError
 from openhound.core.lookup import LookupManager
 
 
@@ -46,7 +48,9 @@ class OktaLookup(LookupManager):
 
     @lru_cache
     def non_admin_groups(self):
-        res = self._find_all_objects(f"""SELECT id FROM {self.schema}.non_admin_groups""")
+        res = self._find_all_objects(
+            f"""SELECT id FROM {self.schema}.non_admin_groups"""
+        )
         return res
 
     @lru_cache
@@ -69,10 +73,80 @@ class OktaLookup(LookupManager):
 
     @lru_cache
     def user_status(self, user_id: str) -> str | None:
-        return self._find_single_object(
-            f"""SELECT status FROM {self.schema}.users WHERE id = ?""",
-            [user_id],
+        try:
+            return self._find_single_object(
+                f"""SELECT status FROM {self.schema}.users WHERE id = ?""",
+                [user_id],
+            )
+        except DuckDBError:
+            return None
+
+    @lru_cache
+    def user_profile(self, user_id: str) -> dict[str, Any] | None:
+        try:
+            profile = self._find_single_object(
+                f"""SELECT profile FROM {self.schema}.users WHERE id = ?""",
+                [user_id],
+            )
+        except DuckDBError:
+            return None
+        if isinstance(profile, str):
+            try:
+                decoded = json.loads(profile)
+            except (json.JSONDecodeError, TypeError):
+                return None
+            return decoded if isinstance(decoded, dict) else None
+        return profile if isinstance(profile, dict) else None
+
+    @lru_cache
+    def saml_claim_mappings(self, app_id: str) -> tuple[dict[str, Any], ...]:
+        try:
+            available_columns = {
+                row[0]
+                for row in self._find_all_objects(
+                    f"""DESCRIBE {self.schema}.saml_claim_mappings"""
+                )
+            }
+        except DuckDBError:
+            return ()
+        required_columns = {
+            "id",
+            "app_id",
+            "claim_name",
+            "mapping_type",
+            "claim_type",
+            "expression",
+        }
+        if not required_columns <= available_columns:
+            return ()
+        selected_columns = [
+            column
+            for column in (
+                "id",
+                "claim_name",
+                "mapping_type",
+                "mapping_origin",
+                "claim_type",
+                "source_property",
+                "expression",
+                "name_id_format",
+                "format",
+                "format_was_omitted",
+                "name_format",
+                "name_format_was_omitted",
+            )
+            if column in available_columns
+        ]
+        rows = self._find_all_objects(
+            f"""
+            SELECT {", ".join(selected_columns)}
+            FROM {self.schema}.saml_claim_mappings
+            WHERE app_id = ?
+            ORDER BY TRY_CAST(regexp_extract(id, '([0-9]+)$', 1) AS INTEGER), id
+            """,
+            [app_id],
         )
+        return tuple(dict(zip(selected_columns, row, strict=True)) for row in rows)
 
     @lru_cache
     def all_api_services(self):

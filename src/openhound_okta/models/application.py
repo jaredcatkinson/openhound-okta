@@ -18,7 +18,17 @@ from openhound_okta.main import app
 
 @dataclass
 class ApplicationProperties(OktaNodeProperties):
-    """Properties for the Okta_ApplicationNode node"""
+    """Properties for the Okta_ApplicationNode node.
+
+    Attributes:
+        label: Human-readable application label.
+        status: Okta application lifecycle status.
+        created: Timestamp when the application was created.
+        last_updated: Timestamp when the application was last updated.
+        sign_on_mode: Authentication mode configured for the application.
+        orn: Okta Resource Name for the application.
+        idp_id: Native inbound identity-provider ID referenced by the application.
+    """
 
     label: str
     status: str
@@ -26,6 +36,7 @@ class ApplicationProperties(OktaNodeProperties):
     last_updated: datetime | None = None
     sign_on_mode: str | None = None
     orn: str | None = None
+    idp_id: str | None = None
 
 
 class JWK(BaseModel):
@@ -187,6 +198,11 @@ class Application(BaseAsset):
                 last_updated=self.last_updated,
                 sign_on_mode=self.sign_on_mode,
                 orn=self.orn,
+                idp_id=(
+                    self.settings.app.get("idpId")
+                    if self.settings and self.settings.app
+                    else None
+                ),
                 environmentid=self._lookup.org_id(),
             ),
         )

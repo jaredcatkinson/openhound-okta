@@ -108,6 +108,7 @@ API_RATE_LIMIT_ENDPOINTS = [
     "/api/v1/users*",
     "/api/v1/groups*",
     "/api/v1/apps*",
+    "/api/v1/idps*",
     "/api/v1/iam*",
     "/api/v1/devices*",
     "/oauth2/v1/clients*",
@@ -224,6 +225,15 @@ class ClientPool:
             throttle=throttles["/api/v1/apps*"],
             rate_limit_max_elapsed_seconds=rate_limit_max_elapsed_seconds,
         )
+        self._idp_saml_metadata_client = OktaRESTClient(
+            base_url=base_url,
+            headers={"accept": "application/xml"},
+            auth=auth,
+            paginator=paginator,
+            endpoint_family="/api/v1/idps*",
+            throttle=throttles["/api/v1/idps*"],
+            rate_limit_max_elapsed_seconds=rate_limit_max_elapsed_seconds,
+        )
 
     def get_client(self, path: str) -> RESTClient:
         for pattern in self._clients:
@@ -238,6 +248,8 @@ class ClientPool:
         return self.get_client(path).get(path, **kwargs)
 
     def get_saml_metadata(self, path: str):
+        if fnmatch.fnmatch(path, "/api/v1/idps*"):
+            return self._idp_saml_metadata_client.get(path)
         return self._saml_metadata_client.get(path)
 
 
@@ -371,35 +383,13 @@ def _saml_metadata_fields(
     if not app_id:
         return {}
 
-    try:
-        response = ctx.pool.get_saml_metadata(
-            f"/api/v1/apps/{app_id}/sso/saml/metadata"
-        )
-        metadata = response.text
-        root = ET.fromstring(metadata)
-    except OktaRetryExhaustedError:
-        logger.error(
-            "Required SAML metadata request exhausted retries for Okta app %s",
-            app_id,
-            exc_info=True,
-        )
-        raise
-    except requests.HTTPError as exc:
-        status_code = exc.response.status_code if exc.response is not None else None
-        if status_code not in {403, 404}:
-            raise
-        logger.warning(
-            "SAML metadata is unavailable for Okta app %s status=%s",
-            app_id,
-            status_code,
-        )
-        return {}
-    except ET.ParseError:
-        logger.warning(
-            "Okta returned invalid SAML metadata XML for app %s",
-            app_id,
-            exc_info=True,
-        )
+    root = _saml_metadata_root(
+        ctx,
+        f"/api/v1/apps/{app_id}/sso/saml/metadata",
+        "app",
+        app_id,
+    )
+    if root is None:
         return {}
 
     namespace = {"md": "urn:oasis:names:tc:SAML:2.0:metadata"}
@@ -419,6 +409,98 @@ def _saml_metadata_fields(
         result["saml_metadata_entity_id"] = root.attrib["entityID"]
     if sso_url:
         result["saml_metadata_sso_url"] = sso_url
+    return result
+
+
+def _saml_metadata_root(
+    ctx: SourceContext,
+    path: str,
+    object_kind: str,
+    object_id: str,
+) -> ET.Element | None:
+    try:
+        response = ctx.pool.get_saml_metadata(path)
+        return ET.fromstring(response.text)
+    except OktaRetryExhaustedError:
+        logger.error(
+            "Required SAML metadata request exhausted retries for Okta %s %s",
+            object_kind,
+            object_id,
+            exc_info=True,
+        )
+        raise
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code not in {403, 404}:
+            raise
+        logger.warning(
+            "SAML metadata is unavailable for Okta %s %s status=%s",
+            object_kind,
+            object_id,
+            status_code,
+        )
+        return None
+    except ET.ParseError:
+        logger.warning(
+            "Okta returned invalid SAML metadata XML for %s %s",
+            object_kind,
+            object_id,
+            exc_info=True,
+        )
+        return None
+
+
+def _saml_idp_metadata_fields(
+    ctx: SourceContext,
+    identity_provider: dict[str, Any],
+) -> dict[str, Any]:
+    metadata_link = (identity_provider.get("_links") or {}).get("metadata") or {}
+    idp_id = identity_provider.get("id")
+    if not metadata_link.get("href") or not idp_id:
+        return {}
+
+    root = _saml_metadata_root(
+        ctx,
+        f"/api/v1/idps/{idp_id}/metadata.xml",
+        "identity provider",
+        idp_id,
+    )
+    if root is None:
+        return {}
+
+    namespace = {"md": "urn:oasis:names:tc:SAML:2.0:metadata"}
+    endpoints = []
+    for node in root.findall(
+        ".//md:SPSSODescriptor/md:AssertionConsumerService",
+        namespace,
+    ):
+        location = node.attrib.get("Location")
+        if not location:
+            continue
+        raw_index = node.attrib.get("index")
+        try:
+            index = int(raw_index) if raw_index is not None else None
+        except ValueError:
+            index = None
+        raw_default = node.attrib.get("isDefault")
+        endpoints.append(
+            {
+                "url": location,
+                "binding": node.attrib.get("Binding"),
+                "index": index,
+                "is_default": (
+                    raw_default.casefold() == "true"
+                    if raw_default is not None
+                    else None
+                ),
+            }
+        )
+
+    result: dict[str, Any] = {}
+    if root.attrib.get("entityID"):
+        result["saml_metadata_entity_id"] = root.attrib["entityID"]
+    if endpoints:
+        result["saml_metadata_acs_endpoints"] = endpoints
     return result
 
 
@@ -497,6 +579,7 @@ def application_user_rows(application: Application, ctx: SourceContext):
                     "app_features": application.features,
                     "app_name": application.name,
                     "app_label": application.label,
+                    "app_status": getattr(application, "status", None),
                     "app_settings": application.settings.app
                     if application.settings
                     else None,
@@ -798,6 +881,12 @@ def identity_providers(ctx: SourceContext):
     """
     for page in ctx.pool.paginate("/api/v1/idps"):
         for item in page:
+            protocol = item.get("protocol") or {}
+            if (
+                item.get("type") == "SAML2"
+                and protocol.get("type") == "SAML2"
+            ):
+                item = {**item, **_saml_idp_metadata_fields(ctx, item)}
             yield item
 
 

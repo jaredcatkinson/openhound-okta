@@ -13,6 +13,7 @@ from openhound_okta.source import (
     APPLICATION_USERS_PAGE_SIZE,
     GROUP_PUSH_MAPPINGS_PAGE_SIZE,
     IDENTITY_PROVIDER_USERS_PAGE_SIZE,
+    _saml_idp_metadata_fields,
     _saml_metadata_fields,
     application_group_push_mappings,
     application_user_rows,
@@ -506,6 +507,88 @@ def test_saml_metadata_retry_exhaustion_is_not_silently_discarded():
     assert exc.value is error
 
 
+def test_inbound_idp_metadata_preserves_entity_and_all_acs_routes():
+    metadata = """\
+<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+                     entityID="https://www.okta.com/saml2/service-provider">
+  <md:SPSSODescriptor>
+    <md:AssertionConsumerService
+        Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
+        Location="https://example.okta.test/sso/saml2/0oa123"
+        index="0"
+        isDefault="true"/>
+    <md:AssertionConsumerService
+        Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"
+        Location="https://example.okta.test/sso/saml2/alternate"
+        index="2"/>
+  </md:SPSSODescriptor>
+</md:EntityDescriptor>
+"""
+
+    class MetadataPool:
+        def get_saml_metadata(self, path):
+            assert path == "/api/v1/idps/0oa123/metadata.xml"
+            return SimpleNamespace(text=metadata)
+
+    identity_provider = {
+        "id": "0oa123",
+        "_links": {
+            "metadata": {
+                "href": "https://example.okta.test/api/v1/idps/0oa123/metadata.xml"
+            }
+        },
+    }
+
+    assert _saml_idp_metadata_fields(
+        SimpleNamespace(pool=MetadataPool()),
+        identity_provider,
+    ) == {
+        "saml_metadata_entity_id": (
+            "https://www.okta.com/saml2/service-provider"
+        ),
+        "saml_metadata_acs_endpoints": [
+            {
+                "url": "https://example.okta.test/sso/saml2/0oa123",
+                "binding": "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+                "index": 0,
+                "is_default": True,
+            },
+            {
+                "url": "https://example.okta.test/sso/saml2/alternate",
+                "binding": "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect",
+                "index": 2,
+                "is_default": None,
+            },
+        ],
+    }
+
+
+def test_inbound_idp_metadata_retry_exhaustion_is_not_silently_discarded():
+    error = OktaRetryExhaustedError(
+        OktaRetryContext(
+            endpoint_family="/api/v1/idps*",
+            url="https://example.okta.test/api/v1/idps/0oa123/metadata.xml",
+            status_code=429,
+            attempts=4,
+        )
+    )
+
+    class FailingMetadataPool:
+        def get_saml_metadata(self, path):
+            raise error
+
+    identity_provider = {
+        "id": "0oa123",
+        "_links": {"metadata": {"href": "https://example.okta.test/metadata"}},
+    }
+    ctx = SimpleNamespace(pool=FailingMetadataPool())
+
+    with pytest.raises(OktaRetryExhaustedError) as exc:
+        _saml_idp_metadata_fields(ctx, identity_provider)
+
+    assert exc.value is error
+
+
 def test_user_role_retry_exhaustion_is_not_silently_discarded():
     error = OktaRetryExhaustedError(
         OktaRetryContext(
@@ -547,6 +630,7 @@ def test_application_users_streams_rows_and_requests_the_maximum_page_size():
         features=[],
         name="example_app",
         label="Example App",
+        status="ACTIVE",
         settings=None,
         credentials=None,
         sign_on_mode="SAML_2_0",
@@ -558,7 +642,9 @@ def test_application_users_streams_rows_and_requests_the_maximum_page_size():
     )
     rows = application_user_rows(application, ctx)
 
-    assert next(rows)["id"] == "00u_first"
+    first_row = next(rows)
+    assert first_row["id"] == "00u_first"
+    assert first_row["app_status"] == "ACTIVE"
     with pytest.raises(RuntimeError, match="cursor failed"):
         next(rows)
 

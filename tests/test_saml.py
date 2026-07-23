@@ -1,3 +1,9 @@
+from dataclasses import asdict
+import json
+
+import duckdb
+
+from openhound_okta.lookup import OktaLookup
 from openhound_okta.kinds import edges as ek
 from openhound_okta.models.application import Application
 from openhound_okta.models.application_users import ApplicationUser
@@ -53,6 +59,32 @@ def _application(**overrides) -> Application:
     }
     data.update(overrides)
     return Application.model_validate(data)
+
+
+class _ApplicationLookup:
+    def org_id(self) -> str:
+        return "00o_example"
+
+
+def test_application_node_emits_native_idp_id_when_present() -> None:
+    app = _application(
+        settings={
+            "app": {"idpId": "0oa_inbound_idp"},
+            "signOn": {},
+        }
+    )
+    app._lookup = _ApplicationLookup()
+    app._extras = {"tenant": "example.okta.test"}
+
+    assert asdict(app.as_node)["properties"]["idp_id"] == "0oa_inbound_idp"
+
+
+def test_application_node_omits_native_idp_id_when_absent() -> None:
+    app = _application()
+    app._lookup = _ApplicationLookup()
+    app._extras = {"tenant": "example.okta.test"}
+
+    assert asdict(app.as_node)["properties"]["idp_id"] is None
 
 
 def _identity_provider(**overrides) -> IdentityProvider:
@@ -154,16 +186,104 @@ def _automatic_username_policy(template: str = "idpuser.email") -> dict:
 
 
 class _SamlLookup:
-    def __init__(self, accounts=(), status: str | None = None):
+    def __init__(
+        self,
+        accounts=(),
+        status: str | None = None,
+        source_profile: dict | None = None,
+        claim_mappings: tuple[dict, ...] = (),
+    ):
         self.accounts = accounts
         self.status = status
+        self.source_profile = source_profile
+        self.claim_mappings = claim_mappings
 
     def iter_user_saml_accounts(self):
         yield from self.accounts
 
     def user_status(self, user_id: str) -> str | None:
-        assert user_id == "00u_okta_user"
+        assert user_id in {"00u_okta_user", "00u_saml_user"}
         return self.status
+
+    def user_profile(self, user_id: str) -> dict | None:
+        assert user_id == "00u_saml_user"
+        return self.source_profile
+
+    def saml_claim_mappings(self, app_id: str) -> tuple[dict, ...]:
+        assert app_id == "0oa_saml"
+        return self.claim_mappings
+
+
+def _claim_mapping(index: int, **overrides) -> dict:
+    row = {
+        "id": f"okta:saml:claim-mapping:0oa_saml:{index}",
+        "app_id": "0oa_saml",
+        "claim_name": "NameID",
+        "mapping_type": "name_id",
+        "claim_type": "name_id",
+        "source_property": "source.login",
+        "expression": "${source.login}",
+        "format": "urn:oasis:names:tc:SAML:1.0:nameid-format:unspecified",
+        "name_format": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_saml_lookup_reads_source_profile_and_ordered_claim_mappings() -> None:
+    connection = duckdb.connect(":memory:")
+    connection.execute("CREATE SCHEMA okta")
+    connection.execute(
+        "CREATE TABLE okta.users (id VARCHAR, status VARCHAR, profile JSON)"
+    )
+    connection.execute(
+        "INSERT INTO okta.users VALUES (?, ?, ?)",
+        ["00u_saml_user", "ACTIVE", '{"login":"Alice.Login","custom":"C-1"}'],
+    )
+    connection.execute(
+        """
+        CREATE TABLE okta.saml_claim_mappings (
+            id VARCHAR,
+            app_id VARCHAR,
+            claim_name VARCHAR,
+            mapping_type VARCHAR,
+            mapping_origin VARCHAR,
+            claim_type VARCHAR,
+            source_property VARCHAR,
+            expression VARCHAR,
+            name_id_format VARCHAR,
+            format VARCHAR,
+            name_format VARCHAR
+        )
+        """
+    )
+    for index in (10, 2):
+        connection.execute(
+            """
+            INSERT INTO okta.saml_claim_mappings
+            VALUES (?, '0oa_saml', 'claim', 'attribute', 'attribute_statement',
+                    'attribute', 'user.custom', 'user.custom', NULL, NULL, NULL)
+            """,
+            [f"okta:saml:claim-mapping:0oa_saml:{index}"],
+        )
+
+    lookup = OktaLookup(connection)
+
+    assert lookup.user_profile("00u_saml_user") == {
+        "login": "Alice.Login",
+        "custom": "C-1",
+    }
+    assert [row["id"] for row in lookup.saml_claim_mappings("0oa_saml")] == [
+        "okta:saml:claim-mapping:0oa_saml:2",
+        "okta:saml:claim-mapping:0oa_saml:10",
+    ]
+
+    missing_mapping_connection = duckdb.connect(":memory:")
+    missing_mapping_connection.execute("CREATE SCHEMA okta")
+    missing_mapping_lookup = OktaLookup(missing_mapping_connection)
+    assert missing_mapping_lookup.user_status("00u_saml_user") is None
+    assert missing_mapping_lookup.user_profile("00u_saml_user") is None
+    assert missing_mapping_lookup.saml_claim_mappings("0oa_saml") == ()
 
 
 def test_saml_provider_is_emitted_when_route_metadata_is_partial():
@@ -705,6 +825,7 @@ def test_saml_eligible_for_uses_configured_match_value():
     ]
     assert eligible[0].properties.schema_contract_version == SAML_CONTRACT_VERSION
     assert eligible[0].properties.source_property == "source.login"
+    assert eligible[0].properties.assignment_source == "direct_assignment"
 
 
 def test_saml_eligible_for_promotes_standard_email_nameid() -> None:
@@ -722,6 +843,286 @@ def test_saml_eligible_for_promotes_standard_email_nameid() -> None:
     assert eligible.properties.match_values == ["alice.saml@example.test"]
     assert eligible.properties.email_match_values == ["alice.saml@example.test"]
     assert eligible.properties.scoped_exact_match_values == []
+
+
+def test_saml_assignment_materializes_all_resolvable_claim_values() -> None:
+    app_user = _application_user(
+        app_status="ACTIVE",
+        scope="GROUP",
+        profile={
+            "login": "app-alice",
+            "email": "app-alice@example.test",
+            "employeeNumber": "APP-1007",
+        },
+    )
+    app_user._lookup = _SamlLookup(
+        status="ACTIVE",
+        source_profile={
+            "login": "Alice.Login",
+            "email": "Alice@Example.TEST",
+            "employeeNumber": "E-1007",
+            "blankCode": "   ",
+        },
+        claim_mappings=(
+            _claim_mapping(0),
+            _claim_mapping(
+                1,
+                claim_name="email",
+                mapping_type="configured_attribute",
+                claim_type="attribute",
+                source_property="user.email",
+                expression="user.email",
+                format=None,
+                name_format=("urn:oasis:names:tc:SAML:2.0:attrname-format:unspecified"),
+            ),
+            _claim_mapping(
+                2,
+                claim_name="UPN",
+                mapping_type="configured_attribute",
+                claim_type="attribute",
+                source_property="user.email",
+                expression="user.email",
+                format=None,
+            ),
+            _claim_mapping(
+                3,
+                claim_name="urn:example:employeeNumber",
+                mapping_type="configured_attribute",
+                claim_type="attribute",
+                source_property="user.employeeNumber",
+                expression="user.employeeNumber",
+                format=None,
+            ),
+            _claim_mapping(
+                4,
+                claim_name="email",
+                mapping_type="configured_attribute",
+                claim_type="attribute",
+                source_property="user.email",
+                expression="user.email",
+                format=None,
+            ),
+            _claim_mapping(
+                5,
+                claim_name="http://schemas.microsoft.com/identity/claims/objectidentifier",
+                mapping_type="configured_attribute",
+                claim_type="attribute",
+                source_property="user.objectId",
+                expression="user.objectId",
+                format=None,
+            ),
+            _claim_mapping(
+                6,
+                claim_name="urn:example:blankCode",
+                mapping_type="configured_attribute",
+                claim_type="attribute",
+                source_property="user.blankCode",
+                expression="user.blankCode",
+                format=None,
+            ),
+            _claim_mapping(
+                7,
+                claim_name="email",
+                mapping_type="configured_attribute",
+                claim_type="attribute",
+                source_property="String.toLowerCase(user.email)",
+                expression="String.toLowerCase(user.email)",
+                format=None,
+            ),
+            _claim_mapping(
+                8,
+                claim_name="http://schemas.xmlsoap.org/claims/Group",
+                mapping_type="configured_attribute",
+                claim_type="attribute",
+                source_property=None,
+                expression='{"name":"groups","type":"GROUP"}',
+                format=None,
+            ),
+            _claim_mapping(
+                9,
+                claim_name="email",
+                mapping_type="configured_attribute",
+                claim_type="attribute",
+                source_property="user.login",
+                expression="user.email",
+                format=None,
+            ),
+            _claim_mapping(
+                10,
+                claim_name="urn:example:applicationEmployeeNumber",
+                mapping_type="configured_attribute",
+                claim_type="attribute",
+                source_property="appuser.employeeNumber",
+                expression="appuser.employeeNumber",
+                format=None,
+            ),
+        ),
+    )
+
+    saml_edges = [
+        edge
+        for edge in app_user.edges
+        if edge.kind in {ek.SAML_ELIGIBLE_FOR, ek.SAML_HAS_CLAIM_VALUE}
+    ]
+    eligible = next(edge for edge in saml_edges if edge.kind == ek.SAML_ELIGIBLE_FOR)
+
+    assert eligible.properties.match_values == [
+        "Alice.Login",
+        "Alice@Example.TEST",
+    ]
+    assert eligible.properties.email_match_values == ["alice@example.test"]
+    assert eligible.properties.upn_match_values == ["alice@example.test"]
+    assert eligible.properties.entra_object_id_match_values == []
+    assert eligible.properties.scoped_exact_match_values == []
+    assert eligible.properties.incomplete_match_value_fields == [
+        "email_match_values",
+        "entra_object_id_match_values",
+    ]
+    assert eligible.properties.assignment_source == "group_assignment"
+    assert eligible.properties.source_properties == [
+        "source.login",
+        "user.email",
+    ]
+
+    claim_edges = {
+        edge.end.value: edge
+        for edge in saml_edges
+        if edge.kind == ek.SAML_HAS_CLAIM_VALUE
+    }
+    assert claim_edges[
+        "okta:saml:claim-mapping:0oa_saml:3"
+    ].properties.match_values == ["E-1007"]
+    assert claim_edges[
+        "okta:saml:claim-mapping:0oa_saml:3"
+    ].properties.canonical_match_values == ["E-1007"]
+    assert claim_edges[
+        "okta:saml:claim-mapping:0oa_saml:10"
+    ].properties.match_values == ["APP-1007"]
+    for mapping_id in (
+        "okta:saml:claim-mapping:0oa_saml:6",
+        "okta:saml:claim-mapping:0oa_saml:8",
+    ):
+        assert claim_edges[mapping_id].properties.match_values == []
+        assert claim_edges[mapping_id].properties.canonical_match_values == []
+        assert claim_edges[mapping_id].properties.incomplete is True
+
+    emitted = json.loads(json.dumps([asdict(edge) for edge in saml_edges]))
+    assert len(emitted) == 5
+    assert emitted[0]["properties"]["schema_contract_version"] == (
+        SAML_CONTRACT_VERSION
+    )
+
+
+def test_saml_assignment_fails_closed_when_mapping_data_is_unavailable() -> None:
+    app_user = _application_user(app_status="ACTIVE")
+    app_user._lookup = _SamlLookup(
+        status="ACTIVE",
+        source_profile={
+            "login": "must-not-be-inferred",
+            "email": "must-not-be-inferred@example.test",
+        },
+        claim_mappings=(),
+    )
+
+    eligible = next(
+        edge for edge in app_user.edges if edge.kind == ek.SAML_ELIGIBLE_FOR
+    )
+
+    assert eligible.properties.match_values == []
+    assert eligible.properties.email_match_values == []
+    assert eligible.properties.upn_match_values == []
+    assert eligible.properties.entra_object_id_match_values == []
+    assert eligible.properties.scoped_exact_match_values == []
+    assert eligible.properties.incomplete_match_value_fields == [
+        "email_match_values",
+        "upn_match_values",
+        "entra_object_id_match_values",
+        "scoped_exact_match_values",
+    ]
+
+
+def test_saml_assignment_does_not_substitute_app_profile_for_missing_source() -> None:
+    app_user = _application_user(
+        app_status="ACTIVE",
+        profile={"email": "app-profile@example.test"},
+        credentials={"userName": "app-username@example.test"},
+    )
+    app_user._lookup = _SamlLookup(
+        status="ACTIVE",
+        source_profile=None,
+        claim_mappings=(
+            _claim_mapping(
+                1,
+                claim_name="email",
+                mapping_type="configured_attribute",
+                claim_type="attribute",
+                source_property="user.email",
+                expression="user.email",
+                format=None,
+            ),
+        ),
+    )
+
+    eligible = next(
+        edge for edge in app_user.edges if edge.kind == ek.SAML_ELIGIBLE_FOR
+    )
+
+    assert eligible.properties.match_values == []
+    assert eligible.properties.email_match_values == []
+    assert eligible.properties.incomplete_match_value_fields == ["email_match_values"]
+
+
+def test_transient_nameid_is_explanatory_only() -> None:
+    app_user = _application_user(app_status="ACTIVE")
+    app_user._lookup = _SamlLookup(
+        status="ACTIVE",
+        source_profile={"login": "temporary-subject-123"},
+        claim_mappings=(
+            _claim_mapping(
+                0,
+                format="urn:oasis:names:tc:SAML:2.0:nameid-format:transient",
+            ),
+        ),
+    )
+
+    saml_edges = [
+        edge
+        for edge in app_user.edges
+        if edge.kind in {ek.SAML_ELIGIBLE_FOR, ek.SAML_HAS_CLAIM_VALUE}
+    ]
+    eligible = next(edge for edge in saml_edges if edge.kind == ek.SAML_ELIGIBLE_FOR)
+    claim_value = next(
+        edge for edge in saml_edges if edge.kind == ek.SAML_HAS_CLAIM_VALUE
+    )
+
+    assert eligible.properties.match_values == []
+    assert eligible.properties.email_match_values == []
+    assert eligible.properties.upn_match_values == []
+    assert eligible.properties.scoped_exact_match_values == []
+    assert claim_value.properties.match_values == ["temporary-subject-123"]
+    assert claim_value.properties.canonical_match_values == []
+    assert claim_value.properties.unsafe_match_values == ["temporary-subject-123"]
+
+
+def test_saml_assertion_edges_respect_provider_and_principal_lifecycle() -> None:
+    mappings = (_claim_mapping(0),)
+    for app_status, principal_status in (
+        ("INACTIVE", "ACTIVE"),
+        ("ACTIVE", "SUSPENDED"),
+        ("ACTIVE", "LOCKED_OUT"),
+    ):
+        app_user = _application_user(app_status=app_status)
+        app_user._lookup = _SamlLookup(
+            status=principal_status,
+            source_profile={"login": "Alice.Login"},
+            claim_mappings=mappings,
+        )
+
+        assert not [
+            edge
+            for edge in app_user.edges
+            if edge.kind in {ek.SAML_ELIGIBLE_FOR, ek.SAML_HAS_CLAIM_VALUE}
+        ]
 
 
 def test_saml_service_provider_links_only_to_resolved_route_nodes():
@@ -760,6 +1161,50 @@ def test_saml_service_provider_links_only_to_resolved_route_nodes():
         ek.SAML_TRUSTS_ISSUER,
         ek.SAML_HAS_ASSERTION_CONSUMER_SERVICE,
     ]
+
+
+def test_saml_service_provider_prefers_inbound_idp_metadata_routes():
+    idp = _identity_provider(
+        _links={
+            "acs": {
+                "href": "https://example.okta.test/sso/saml2",
+                "type": "application/xml",
+            }
+        },
+        saml_metadata_entity_id="https://www.okta.com/saml2/service-provider",
+        saml_metadata_acs_endpoints=[
+            {
+                "url": "https://example.okta.test/sso/saml2/0oa_idp",
+                "binding": "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+                "index": 0,
+                "is_default": True,
+            },
+            {
+                "url": "https://example.okta.test/sso/saml2/alternate",
+                "binding": "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+                "index": 2,
+                "is_default": False,
+            },
+        ],
+    )
+
+    service_provider = saml_service_provider_row(idp)
+    acs_rows = saml_sp_acs_rows(idp)
+
+    assert service_provider is not None
+    assert service_provider["sp_entity_id"] == (
+        "https://www.okta.com/saml2/service-provider"
+    )
+    assert service_provider["acs_ids"] == [row["id"] for row in acs_rows]
+    assert [row["acs_url"] for row in acs_rows] == [
+        "https://example.okta.test/sso/saml2/0oa_idp",
+        "https://example.okta.test/sso/saml2/alternate",
+    ]
+    assert [row["index"] for row in acs_rows] == [0, 2]
+    assert [row["is_default"] for row in acs_rows] == [True, False]
+    assert {row["route_source"] for row in acs_rows} == {
+        "identity_provider_metadata"
+    }
 
 
 def test_saml_service_provider_is_emitted_when_route_metadata_is_partial():

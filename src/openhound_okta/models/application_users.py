@@ -8,7 +8,8 @@ from openhound_okta.kinds import edges as ek, nodes as nk
 from openhound_okta.main import app
 from openhound_okta.models.saml import (
     SamlMatchValuesEdgeProperties,
-    saml_application_identity_evidence,
+    SamlResolutionValueEdgeProperties,
+    saml_application_assertion_evidence,
     saml_match_source,
     saml_provider_id,
 )
@@ -20,7 +21,7 @@ SYSTEM_APPS = [
     "okta_enduser",  # Okta Dashboard
     "okta_browser_plugin",  # Okta Browser Plugin
     "active_directory",  # Active Directory, for which there are sync edges
-    "ldap_interface"  # LDAP Interface, similar to AD
+    "ldap_interface",  # LDAP Interface, similar to AD
 ]
 
 
@@ -36,7 +37,7 @@ class Credentials(BaseModel):
 
 
 class Profile(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
     email: str | None = None
     first_name: str | None = Field(default=None, alias="firstName")
     last_name: str | None = Field(default=None, alias="lastName")
@@ -118,6 +119,13 @@ class Profile(BaseModel):
             traversable=False,
             description="Okta user is eligible for a normalized SAML provider",
         ),
+        EdgeDef(
+            kind=ek.SAML_HAS_CLAIM_VALUE,
+            start=nk.USER,
+            end=nk.SAML_CLAIM_MAPPING,
+            traversable=False,
+            description="Okta user has a value for an exceptional SAML claim",
+        ),
     ],
 )
 class ApplicationUser(BaseAsset):
@@ -140,6 +148,7 @@ class ApplicationUser(BaseAsset):
     app_features: list[str] = Field(default_factory=list)
     app_name: str
     app_label: str
+    app_status: str | None = None
     app_settings: dict | None = None
     app_sign_on_mode: str | None = None
     app_subject_name_id_template: str | None = None
@@ -196,7 +205,11 @@ class ApplicationUser(BaseAsset):
 
     @property
     def _password_sync_edge(self):
-        if self.sync_state == "SYNCHRONIZED" and self.app_name == "active_directory" and self.profile.object_sid:
+        if (
+            self.sync_state == "SYNCHRONIZED"
+            and self.app_name == "active_directory"
+            and self.profile.object_sid
+        ):
             if self.scope == "USER":
                 yield Edge(
                     kind=ek.USER_SYNC,
@@ -255,14 +268,41 @@ class ApplicationUser(BaseAsset):
                     )
 
     @property
-    def _saml_eligible_for_edges(self):
+    def _saml_assertion_edges(self):
         if self.app_sign_on_mode != "SAML_2_0":
+            return
+        if self.app_status is not None and self.app_status != "ACTIVE":
             return
         if self.status not in {"ACTIVE", "PROVISIONED"}:
             return
-        evidence = saml_application_identity_evidence(self)
-        if not evidence["match_values"]:
+        lookup = getattr(self, "_lookup", None)
+        lookup_available = all(
+            callable(getattr(lookup, method, None))
+            for method in ("user_status", "user_profile", "saml_claim_mappings")
+        )
+        if lookup_available:
+            source_user_status = lookup.user_status(self.id)
+            source_profile = lookup.user_profile(self.id)
+            claim_mappings = lookup.saml_claim_mappings(self.app_id)
+        else:
+            source_user_status = None
+        if source_user_status in {
+            "SUSPENDED",
+            "DEPROVISIONED",
+            "STAGED",
+            "LOCKED_OUT",
+        }:
             return
+        evidence = (
+            saml_application_assertion_evidence(
+                self,
+                claim_mappings=claim_mappings,
+                source_profile=source_profile,
+            )
+            if lookup_available
+            else saml_application_assertion_evidence(self)
+        )
+        source_properties = evidence["source_properties"]
         yield Edge(
             kind=ek.SAML_ELIGIBLE_FOR,
             start=EdgePath(value=self.id, match_by="id"),
@@ -271,12 +311,37 @@ class ApplicationUser(BaseAsset):
                 traversable=False,
                 match_values=evidence["match_values"],
                 email_match_values=evidence["email_match_values"],
+                upn_match_values=evidence["upn_match_values"],
+                entra_object_id_match_values=evidence["entra_object_id_match_values"],
                 scoped_exact_match_values=evidence["scoped_exact_match_values"],
-                source_property=saml_match_source(
-                    self.app_subject_name_id_template or self.app_user_name_template
+                incomplete_match_value_fields=evidence["incomplete_match_value_fields"],
+                source_property=(
+                    source_properties[0]
+                    if len(source_properties) == 1
+                    else saml_match_source(
+                        self.app_subject_name_id_template or self.app_user_name_template
+                    )
+                ),
+                source_properties=source_properties,
+                assignment_source=(
+                    "direct_assignment" if self.scope == "USER" else "group_assignment"
                 ),
             ),
         )
+        for claim_value in evidence["claim_values"]:
+            yield Edge(
+                kind=ek.SAML_HAS_CLAIM_VALUE,
+                start=EdgePath(value=self.id, match_by="id"),
+                end=EdgePath(value=claim_value["mapping_id"], match_by="id"),
+                properties=SamlResolutionValueEdgeProperties(
+                    traversable=False,
+                    match_values=claim_value["match_values"],
+                    canonical_match_values=claim_value["canonical_match_values"],
+                    unsafe_match_values=claim_value["unsafe_match_values"],
+                    source_property=claim_value["source_property"],
+                    incomplete=claim_value["incomplete"],
+                ),
+            )
 
     @property
     def edges(self):
@@ -285,4 +350,4 @@ class ApplicationUser(BaseAsset):
         yield from self._user_push_poll_edges
         yield from self._password_sync_edge
         yield from self._okta_org2org_edges
-        yield from self._saml_eligible_for_edges
+        yield from self._saml_assertion_edges
